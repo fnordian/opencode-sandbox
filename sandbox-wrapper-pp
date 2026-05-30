@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(realpath "$(pwd)")"
+REAL_SOCK="/run/user/$(id -u)/podman/podman.sock"
+PROXY_SOCK="/run/user/$(id -u)/podman-sandbox-$$.sock"  # $$ = PID, unique per run
+
+if test -z "${1:-}"; then
+    DEFAULTCMD=bash
+fi
+
+# Start the proxy outside the sandbox, in the background.
+# Its stdout passes "ready\n" through to the terminal.
+podman-proxy "$PROJECT_DIR" "$PROXY_SOCK" "$REAL_SOCK" &
+PROXY_PID=$!
+
+# Wait for proxy socket to appear
+for i in $(seq 20); do
+    [[ -S "$PROXY_SOCK" ]] && break
+    sleep 0.1
+done
+[[ -S "$PROXY_SOCK" ]] || { echo "podman-proxy failed to start" >&2; kill $PROXY_PID 2>/dev/null; exit 1; }
+
+# Cleanup proxy when this script exits
+trap 'kill $PROXY_PID 2>/dev/null; rm -f "$PROXY_SOCK"' EXIT
+
+bwrap \
+  --ro-bind /usr /usr \
+  --ro-bind /lib /lib \
+  --ro-bind /lib64 /lib64 \
+  --ro-bind /bin /bin \
+  --ro-bind $HOME/.local $HOME/.local \
+  --ro-bind $HOME/.config $HOME/.config \
+  --ro-bind $HOME/local/go-sdk/ $HOME/local/go-sdk \
+  --bind $HOME/go/pkg/mod $HOME/go/pkg/mod \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf \
+  --ro-bind /etc/hosts /etc/hosts \
+  --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/pki /etc/pki \
+  --ro-bind /etc/localtime /etc/localtime \
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+  --ro-bind /etc/passwd /etc/passwd \
+  --ro-bind /etc/group /etc/group \
+  --ro-bind /run/user/$(id -u)/$WAYLAND_DISPLAY /run/user/$(id -u)/$WAYLAND_DISPLAY \
+  --ro-bind /run/user/$(id -u)/bus /run/user/$(id -u)/bus \
+  --dir /run/user/$(id -u) \
+  --setenv XDG_RUNTIME_DIR /run/user/$(id -u) \
+  --dir /var/home \
+  --bind $HOME/.local/share/opencode $HOME/.local/share/opencode \
+  --proc /proc \
+  --dev /dev \
+  --tmpfs /tmp \
+  --tmpfs /var/tmp \
+  --bind "$PROJECT_DIR" "$PROJECT_DIR" \
+  --ro-bind "$HOME/.config/opencode" "$HOME/.config/opencode" \
+  --bind "$PROXY_SOCK" "/run/user/$(id -u)/podman/podman.sock" \
+  --share-net \
+  --die-with-parent \
+  --setenv HOME "$HOME" \
+  --setenv GOMODCACHE "$HOME/go/pkg/mod" \
+  --chdir "$PROJECT_DIR" \
+  ${DEFAULTCMD:-} "$@"
