@@ -360,8 +360,6 @@ def main():
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(LISTEN_SOCK)
     srv.listen(16)
-    sys.stdout.write("ready\n")
-    sys.stdout.flush()
     while True:
         client, _ = srv.accept()
         threading.Thread(target=handle, args=(client,), daemon=True).start()

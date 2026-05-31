@@ -2,15 +2,77 @@
 set -euo pipefail
 
 PROJECT_DIR="$(realpath "$(pwd)")"
+SCRIPT_DIR="$(cd "$(dirname $(readlink "${BASH_SOURCE[0]}"))" && pwd)"
+HTTP_PROXY_SCRIPT="$SCRIPT_DIR/http-proxy.py"
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 REAL_SOCK="/run/user/$(id -u)/podman/podman.sock"
 PROXY_SOCK="/run/user/$(id -u)/podman-sandbox-$$.sock"  # $$ = PID, unique per run
+BRIDGE_PORT=8888
 
-if test -z "${1:-}"; then
-    DEFAULTCMD=bash
+# Set up http proxy
+#
+
+# Unique socket path in user runtime dir
+HTTP_SOCKET_PATH="/run/user/$(id -u)/sandbox-proxy-$$.sock"
+
+WHITELIST=(
+    # AI / LLM Providers
+    ".*\.anthropic\.com"
+    ".*\.deepseek\.com"
+    ".*\.openai\.com"
+    ".*\.openrouter\.ai"
+
+    # Code / Dev Tools
+    ".*\.opencode\.ai"
+    "github\.com"
+    ".*\.github\.com"
+
+    # Package Registries
+    ".*\.golang\.org"
+    ".*\.maven\.org"
+    ".*\.npmjs\.org"
+    ".*\.pythonhosted\.org"
+    ".*\.pypi\.org"
+    "repo1\.maven\.org"
+
+    # Container Registries
+    "auth\.docker\.io"
+    "production\.cloudflare\.docker\.com"
+    "registry-1\.docker\.io"
+    ".*\.docker\.com"
+    ".*\.docker\.io"
+
+    # Infrastructure / Monitoring
+    ".*\.googleapis\.com"
+    ".*\.sentry\.io"
+
+    "127\.0\.0\.1"
+)
+
+# 1. Start proxy in background
+# It creates the Unix socket file
+"$VENV_PYTHON" "$HTTP_PROXY_SCRIPT" "$HTTP_SOCKET_PATH" "${WHITELIST[@]}" &
+HTTP_PROXY_PID=$!
+
+# 2. Wait for socket to be ready
+HTTP_SOCKET_READY=false
+for i in $(seq 20); do
+    [[ -S "$HTTP_SOCKET_PATH" ]] && HTTP_SOCKET_READY=true && break
+    sleep 0.1
+done
+
+if ! $HTTP_SOCKET_READY; then
+    echo "Proxy failed to start" >&2
+    kill $PROXY_PID 2>/dev/null
+    exit 1
 fi
 
-# Start the proxy outside the sandbox, in the background.
-# Its stdout passes "ready\n" through to the terminal.
+# Bridge: socat translates TCP (inside sandbox) <-> Unix socket (to HTTP proxy)
+# socat's fork model reliably handles bidirectional streaming.
+
+
+
+# Start the podman proxy outside the sandbox, in the background.
 podman-proxy "$PROJECT_DIR" "$PROXY_SOCK" "$REAL_SOCK" &
 PROXY_PID=$!
 
@@ -21,8 +83,16 @@ for i in $(seq 20); do
 done
 [[ -S "$PROXY_SOCK" ]] || { echo "podman-proxy failed to start" >&2; kill $PROXY_PID 2>/dev/null; exit 1; }
 
-# Cleanup proxy when this script exits
-trap 'kill $PROXY_PID 2>/dev/null; rm -f "$PROXY_SOCK"' EXIT
+# Cleanup proxies when this script exits
+trap 'kill $HTTP_PROXY_PID 2>/dev/null; kill $PROXY_PID 2>/dev/null; rm -f "$HTTP_SOCKET_PATH" "$PROXY_SOCK"' EXIT
+
+
+# Determine target command: use bash if no args provided
+if test -z "${1:-}"; then
+    TARGET_CMD=(bash)
+else
+    TARGET_CMD=("$@")
+fi
 
 bwrap \
   --ro-bind /usr /usr \
@@ -32,6 +102,7 @@ bwrap \
   --ro-bind $HOME/.local $HOME/.local \
   --ro-bind $HOME/.config $HOME/.config \
   --ro-bind $HOME/local/go-sdk/ $HOME/local/go-sdk \
+  --bind "$HTTP_SOCKET_PATH" "$HTTP_SOCKET_PATH" \
   --bind $HOME/go/pkg/mod $HOME/go/pkg/mod \
   --ro-bind /etc/resolv.conf /etc/resolv.conf \
   --ro-bind /etc/hosts /etc/hosts \
@@ -45,6 +116,11 @@ bwrap \
   --ro-bind /run/user/$(id -u)/bus /run/user/$(id -u)/bus \
   --dir /run/user/$(id -u) \
   --setenv XDG_RUNTIME_DIR /run/user/$(id -u) \
+  --setenv http_proxy "http://127.0.0.1:$BRIDGE_PORT" \
+  --setenv https_proxy "http://127.0.0.1:$BRIDGE_PORT" \
+  --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
+  --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
+  --setenv no_proxy "" \
   --dir /var/home \
   --bind $HOME/.local/share/opencode $HOME/.local/share/opencode \
   --proc /proc \
@@ -54,9 +130,27 @@ bwrap \
   --bind "$PROJECT_DIR" "$PROJECT_DIR" \
   --ro-bind "$HOME/.config/opencode" "$HOME/.config/opencode" \
   --bind "$PROXY_SOCK" "/run/user/$(id -u)/podman/podman.sock" \
-  --share-net \
+  --unshare-net \
   --die-with-parent \
   --setenv HOME "$HOME" \
   --setenv GOMODCACHE "$HOME/go/pkg/mod" \
   --chdir "$PROJECT_DIR" \
-  ${DEFAULTCMD:-} "$@"
+    /bin/sh -c '
+    # Start socat bridge in background (args 1 and 2)
+    # Listen on 127.0.0.1:$2 (TCP) and fork/connect to $1 (Unix socket)
+    socat TCP-LISTEN:"$2",bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$1" >/dev/null 2>&1 &
+    SOCAT_PID=$!
+
+    # Wait for bridge to be listening on port
+    until (echo > /dev/tcp/127.0.0.1/"$2") 2>/dev/null; do sleep 0.1; done
+
+    # Shift bridge args and run target command (no exec, so we clean up socat after)
+    shift 2
+    "$@"
+    EXIT_CODE=$?
+
+    # Kill socat so bwrap can exit cleanly
+    kill $SOCAT_PID 2>/dev/null
+    wait $SOCAT_PID 2>/dev/null
+    exit $EXIT_CODE
+  ' _ "$HTTP_SOCKET_PATH" "$BRIDGE_PORT" "${TARGET_CMD[@]}"
