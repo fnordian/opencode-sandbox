@@ -2,7 +2,25 @@
 set -euo pipefail
 
 PROJECT_DIR="$(realpath "$(pwd)")"
-SCRIPT_DIR="$(cd "$(dirname $(readlink "${BASH_SOURCE[0]}"))" && pwd)"
+
+# Determine target command: use bash if no args provided
+if test -z "${1:-}"; then
+    TARGET_CMD=(bash)
+else
+    TARGET_CMD=("$@")
+fi
+
+# Detect nesting: if PODMAN_PROXY_SANDBOX_ORIGIN is set, we are already inside
+# a sandbox.  Skip the bwrap/proxy layer entirely and just exec the target
+# command.  Warn on stderr if the origin directory differs.
+if [[ -n "${PODMAN_PROXY_SANDBOX_ORIGIN:-}" ]]; then
+    if [[ "$PODMAN_PROXY_SANDBOX_ORIGIN" != "$PROJECT_DIR" ]]; then
+        echo "Warning: Starting nested sandbox from different directory ('$PROJECT_DIR' vs origin '$PODMAN_PROXY_SANDBOX_ORIGIN')" >&2
+    fi
+    exec "${TARGET_CMD[@]}"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname $(readlink -f "${BASH_SOURCE[0]}"))" && pwd)"
 HTTP_PROXY_SCRIPT="$SCRIPT_DIR/http-proxy.py"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 REAL_SOCK="/run/user/$(id -u)/podman/podman.sock"
@@ -63,7 +81,7 @@ done
 
 if ! $HTTP_SOCKET_READY; then
     echo "Proxy failed to start" >&2
-    kill $PROXY_PID 2>/dev/null
+    kill $HTTP_PROXY_PID 2>/dev/null
     exit 1
 fi
 
@@ -86,13 +104,6 @@ done
 # Cleanup proxies when this script exits
 trap 'kill $HTTP_PROXY_PID 2>/dev/null; kill $PROXY_PID 2>/dev/null; rm -f "$HTTP_SOCKET_PATH" "$PROXY_SOCK"' EXIT
 
-
-# Determine target command: use bash if no args provided
-if test -z "${1:-}"; then
-    TARGET_CMD=(bash)
-else
-    TARGET_CMD=("$@")
-fi
 
 bwrap \
   --ro-bind /usr /usr \
@@ -121,10 +132,19 @@ bwrap \
   --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
   --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
   --setenv no_proxy "" \
+  --setenv PODMAN_PROXY_SANDBOX_ORIGIN "$PROJECT_DIR" \
   --dir /var/home \
   --bind $HOME/.local/share/opencode $HOME/.local/share/opencode \
   --proc /proc \
-  --dev /dev \
+  --dev-bind /dev/null /dev/null \
+  --dev-bind /dev/zero /dev/zero \
+  --dev-bind /dev/random /dev/random \
+  --dev-bind /dev/urandom /dev/urandom \
+  --dev-bind /dev/full /dev/full \
+  --dev-bind /dev/tty /dev/tty \
+  --dev-bind /dev/ptmx /dev/ptmx \
+  --bind /dev/pts /dev/pts \
+  --tmpfs /dev/shm \
   --tmpfs /tmp \
   --tmpfs /var/tmp \
   --bind "$PROJECT_DIR" "$PROJECT_DIR" \
@@ -136,6 +156,12 @@ bwrap \
   --setenv GOMODCACHE "$HOME/go/pkg/mod" \
   --chdir "$PROJECT_DIR" \
     /bin/sh -c '
+    # Create /dev symlinks (proc is already mounted)
+    ln -sf /proc/self/fd /dev/fd
+    ln -sf /proc/self/fd/0 /dev/stdin
+    ln -sf /proc/self/fd/1 /dev/stdout
+    ln -sf /proc/self/fd/2 /dev/stderr
+
     # Start socat bridge in background (args 1 and 2)
     # Listen on 127.0.0.1:$2 (TCP) and fork/connect to $1 (Unix socket)
     socat TCP-LISTEN:"$2",bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$1" >/dev/null 2>&1 &
