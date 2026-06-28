@@ -3,11 +3,114 @@ set -euo pipefail
 
 PROJECT_DIR="$(realpath "$(pwd)")"
 
-# Determine target command: use bash if no args provided
-if test -z "${1:-}"; then
+# Parse options: --ro-bind HOST[:GUEST] [--dev-bind HOST[:GUEST]] [--bind HOST[:GUEST]] [--tmpfs DIR] [--expose PORT[:GUEST]] ... [--] COMMAND [ARGS...]
+# Parsing runs before proxies start, so validation errors exit cleanly.
+EXTRA_RO_BINDS=()
+EXTRA_DEV_BINDS=()
+EXTRA_BINDS=()
+EXTRA_TMPFS=()
+ALLOW_DOMAINS=()
+EXPOSE_SPECS=()       # each element "HOST:GUEST" or ":GUEST" (empty HOST = dynamic)
+TARGET_CMD=()
+OPT_TERMINATED=false
+
+while [[ $# -gt 0 ]]; do
+    if [[ "$OPT_TERMINATED" == true ]]; then
+        TARGET_CMD+=("$1")
+        shift
+        continue
+    fi
+    case "$1" in
+        --ro-bind|--dev-bind|--bind)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a HOST[:GUEST] argument" >&2
+                exit 2
+            fi
+            _arg="$2"
+            # Split on first colon for optional guest destination
+            if [[ "$_arg" == *:* ]]; then
+                _host="${_arg%%:*}"
+                _guest="${_arg#*:}"
+            else
+                _host="$_arg"
+                _guest="$_arg"
+            fi
+            if [[ ! -e "$_host" ]]; then
+                echo "Error: $1 host path does not exist: $_host" >&2
+                exit 2
+            fi
+            _rhost="$(realpath "$_host")"
+            # Push as "HOST:GUEST" pair; GUEST is opaque (sandbox-side path)
+            case "$1" in
+                --ro-bind)  EXTRA_RO_BINDS+=("$_rhost:$_guest") ;;
+                --dev-bind) EXTRA_DEV_BINDS+=("$_rhost:$_guest") ;;
+                --bind)     EXTRA_BINDS+=("$_rhost:$_guest") ;;
+            esac
+            shift 2
+            ;;
+        --allow-domain)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --allow-domain requires a hostname argument" >&2
+                exit 2
+            fi
+            _dom="$2"
+            if [[ "$_dom" == *:* || "$_dom" == */* ]]; then
+                echo "Error: --allow-domain does not support method/path restrictions yet; pass a plain hostname (e.g. --allow-domain example.com). Future syntax: [METHODS:]DOMAIN[/PATH]" >&2
+                exit 2
+            fi
+            if [[ -z "$_dom" ]]; then
+                echo "Error: --allow-domain hostname cannot be empty" >&2
+                exit 2
+            fi
+            ALLOW_DOMAINS+=("$_dom")
+            shift 2
+            ;;
+        --tmpfs)                                                                                                                     
+            if [[ $# -lt 2 ]]; then                                                                                                 
+                echo "Error: --tmpfs requires a path argument" >&2                                                                  
+                exit 2                                                                                                              
+            fi                                                                                                                       
+            EXTRA_TMPFS+=("$2")                                                                                                      
+            shift 2                                                                                                                  
+            ;;                                                                                                                       
+        --expose)                                                                                                                     
+            if [[ $# -lt 2 ]]; then                                                                                                 
+                echo "Error: --expose requires an argument (HOST:GUEST or GUEST)" >&2                                              
+                exit 2                                                                                                              
+            fi                                                                                                                       
+            _exp="$2"                                                                                                               
+            if [[ "$_exp" == *:* ]]; then                                                                                           
+                _h="${_exp%%:*}"                                                                                                    
+                _g="${_exp#*:}"                                                                                                     
+            else                                                                                                                    
+                _h=""                                                                                                               
+                _g="$_exp"                                                                                                          
+            fi                                                                                                                       
+            if ! [[ "$_g" =~ ^[0-9]+$ ]]; then                                                                                     
+                echo "Error: --expose guest port must be numeric: $_g" >&2                                                         
+                exit 2                                                                                                              
+            fi                                                                                                                       
+            if [[ -n "$_h" ]] && ! [[ "$_h" =~ ^[0-9]+$ ]]; then                                                                  
+                echo "Error: --expose host port must be numeric: $_h" >&2                                                         
+                exit 2                                                                                                              
+            fi                                                                                                                       
+            EXPOSE_SPECS+=("$_h:$_g")                                                                                               
+            shift 2                                                                                                                  
+            ;;                                                                                                                       
+        --)
+            OPT_TERMINATED=true
+            shift
+            ;;
+        *)
+            TARGET_CMD+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Default to bash if no target command was given
+if [[ ${#TARGET_CMD[@]} -eq 0 ]]; then
     TARGET_CMD=(bash)
-else
-    TARGET_CMD=("$@")
 fi
 
 # Detect nesting: if PODMAN_PROXY_SANDBOX_ORIGIN is set, we are already inside
@@ -16,6 +119,9 @@ fi
 if [[ -n "${PODMAN_PROXY_SANDBOX_ORIGIN:-}" ]]; then
     if [[ "$PODMAN_PROXY_SANDBOX_ORIGIN" != "$PROJECT_DIR" ]]; then
         echo "Warning: Starting nested sandbox from different directory ('$PROJECT_DIR' vs origin '$PODMAN_PROXY_SANDBOX_ORIGIN')" >&2
+    fi
+    if [[ ${#EXTRA_RO_BINDS[@]} -gt 0 || ${#EXTRA_DEV_BINDS[@]} -gt 0 || ${#EXTRA_BINDS[@]} -gt 0 || ${#EXTRA_TMPFS[@]} -gt 0 || ${#EXPOSE_SPECS[@]} -gt 0 || ${#ALLOW_DOMAINS[@]} -gt 0 ]]; then
+        echo "Warning: --ro-bind/--dev-bind/--bind/--tmpfs/--expose/--allow-domain ignored in nested sandbox" >&2
     fi
     exec "${TARGET_CMD[@]}"
 fi
@@ -35,41 +141,77 @@ HTTP_SOCKET_PATH="/run/user/$(id -u)/sandbox-proxy-$$.sock"
 
 WHITELIST=(
     # AI / LLM Providers
-    ".*\.anthropic\.com"
-    ".*\.deepseek\.com"
-    ".*\.openai\.com"
-    ".*\.openrouter\.ai"
+    "(?:.*\.)?anthropic\.com"
+    "(?:.*\.)?deepseek\.com"
+    "(?:.*\.)?openai\.com"
+    "(?:.*\.)?openrouter\.ai"
 
     # Code / Dev Tools
-    ".*\.opencode\.ai"
-    "github\.com"
-    ".*\.github\.com"
+    "(?:.*\.)?opencode\.ai"
+    "(?:.*\.)?github\.com"               # covers github.com and *.github.com
 
     # Package Registries
-    ".*\.golang\.org"
-    ".*\.maven\.org"
-    ".*\.npmjs\.org"
-    ".*\.pythonhosted\.org"
-    ".*\.pypi\.org"
-    "repo1\.maven\.org"
+    "(?:.*\.)?golang\.org"
+    "(?:.*\.)?maven\.org"
+    "(?:.*\.)?npmjs\.org"
+    "(?:.*\.)?pythonhosted\.org"
+    "(?:.*\.)?pypi\.org"                 # covers pypi.org and *.pypi.org (e.g. files.pypi.org)
+    "(?:.*\.)?maven\.org"
+    "(?:.*\.)?apache\.org"
+    "jcenter\.bintray\.com"
+    "(?:.*\.)?maven\.energybox\.com"
 
     # Container Registries
     "auth\.docker\.io"
     "production\.cloudflare\.docker\.com"
     "registry-1\.docker\.io"
-    ".*\.docker\.com"
-    ".*\.docker\.io"
+    "(?:.*\.)?docker\.com"
+    "(?:.*\.)?docker\.io"
 
     # Infrastructure / Monitoring
-    ".*\.googleapis\.com"
-    ".*\.sentry\.io"
+    "(?:.*\.)?googleapis\.com"
+    "(?:.*\.)?sentry\.io"
+
+    # Code Hosting / Blob Storage (commonly needed by pip install from GitHub)
+    "(?:.*\.)?raw\.githubusercontent\.com"
 
     "127\.0\.0\.1"
+
+    # Cisco documentation
+    "developer\.cisco\.com"
+    "(?:.*\.)?devnetcloud\.com"
+
+    # General information sources
+
+    "(?:.*\.)?gnome\.org"
+    "(?:.*\.)?wikipedia\.org"
+    "(?:.*\.)?linuxuprising\.com"
+    "(?:.*\.)?docs\.dev"
+    "(?:.*\.)?readthedocs\.org"
+    "(?:.*\.)?python\.org"
+    "(?:.*\.)?react\.dev"
+    "(?:.*\.)?stackoverflow\.com"
+    "(?:.*\.)?duckduckgo\.com"
+    "(?:.*\.)?reddit\.com"
+    "(?:.*\.)?githubusercontent\.com"
+    "(?:.*\.)?microsoft\.com"
+    "(?:.*\.)?confluent\.io"
+
+    # Energybox observability
+    "logs\.energybox\.com"
 )
+
+# Convert extra allow-domains to auto-subdomain regex patterns
+ALLOW_DOMAINS_REGEX=()
+for _dom in "${ALLOW_DOMAINS[@]}"; do
+    # Escape dots, then wrap with optional subdomain prefix
+    _escaped="$(echo "$_dom" | sed 's/\./\\./g')"
+    ALLOW_DOMAINS_REGEX+=("(?:.*\.)?${_escaped}")
+done
 
 # 1. Start proxy in background
 # It creates the Unix socket file
-"$VENV_PYTHON" "$HTTP_PROXY_SCRIPT" "$HTTP_SOCKET_PATH" "${WHITELIST[@]}" &
+"$VENV_PYTHON" "$HTTP_PROXY_SCRIPT" "$HTTP_SOCKET_PATH" "${WHITELIST[@]}" "${ALLOW_DOMAINS_REGEX[@]}" &
 HTTP_PROXY_PID=$!
 
 # 2. Wait for socket to be ready
@@ -101,66 +243,179 @@ for i in $(seq 20); do
 done
 [[ -S "$PROXY_SOCK" ]] || { echo "podman-proxy failed to start" >&2; kill $PROXY_PID 2>/dev/null; exit 1; }
 
-# Cleanup proxies when this script exits
-trap 'kill $HTTP_PROXY_PID 2>/dev/null; kill $PROXY_PID 2>/dev/null; rm -f "$HTTP_SOCKET_PATH" "$PROXY_SOCK"' EXIT
+# --- Reverse bridges (--expose) ---
+# Bridge dirs and outside socat PIDs, populated below.
+EXPOSE_BRIDGE_DIRS=()
+EXPOSE_OUTSIDE_PIDS=()
+
+# A helper to allocate an ephemeral port using the venv Python.
+_pick_free_port() {
+    "$VENV_PYTHON" -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+'
+}
+
+for _eidx in "${!EXPOSE_SPECS[@]}"; do
+    _spec="${EXPOSE_SPECS[$_eidx]}"
+    _host="${_spec%%:*}"
+    _guest="${_spec#*:}"
+
+    # If host port is empty, allocate dynamically
+    if [[ -z "$_host" ]]; then
+        _host="$(_pick_free_port)"
+    fi
+
+    # Create a shared bridge directory under XDG_RUNTIME_DIR
+    _bdir="/run/user/$(id -u)/sandbox-bridge-$$-$_eidx"
+    mkdir -p "$_bdir"
+    EXPOSE_BRIDGE_DIRS+=("$_bdir")
+
+    # Start the outside socat: listen on host TCP -> forward to Unix socket inside
+    socat TCP-LISTEN:"$_host",bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$_bdir/sock" >/dev/null 2>&1 &
+    _epid=$!
+    EXPOSE_OUTSIDE_PIDS+=($_epid)
+
+    # Wait for the host-side port to become reachable
+    _readiness_ok=false
+    for _try in $(seq 20); do
+        (echo > /dev/tcp/127.0.0.1/"$_host") 2>/dev/null && _readiness_ok=true && break
+        sleep 0.1
+    done
+    if ! $_readiness_ok; then
+        echo "Error: expose bridge on 127.0.0.1:$_host failed to start" >&2
+        kill "$_epid" 2>/dev/null
+        exit 1
+    fi
+
+    echo "expose: host 127.0.0.1:$_host -> sandbox 127.0.0.1:$_guest (dir $_bdir)" >&2
+done
+
+# Build the env-var string for the sandbox: "<dir>:<guest> <dir>:<guest> ..."
+EXPOSE_SPECS_STR=""
+for _eidx in "${!EXPOSE_SPECS[@]}"; do
+    _bdir="${EXPOSE_BRIDGE_DIRS[$_eidx]}"
+    _spec="${EXPOSE_SPECS[$_eidx]}"
+    _guest="${_spec#*:}"
+    EXPOSE_SPECS_STR+="$_bdir:$_guest "
+done
+EXPOSE_SPECS_STR="${EXPOSE_SPECS_STR% }"  # trim trailing space
+
+# Cleanup all background processes and temp files on exit.
+cleanup() {
+    kill "$HTTP_PROXY_PID" 2>/dev/null
+    kill "$PROXY_PID" 2>/dev/null
+    for _epid in "${EXPOSE_OUTSIDE_PIDS[@]}"; do
+        kill "$_epid" 2>/dev/null
+    done
+    rm -f "$HTTP_SOCKET_PATH" "$PROXY_SOCK"
+    for _bdir in "${EXPOSE_BRIDGE_DIRS[@]}"; do
+        rm -rf "$_bdir"
+    done
+}
+trap cleanup EXIT
 
 
-bwrap \
-  --ro-bind /usr /usr \
-  --ro-bind /lib /lib \
-  --ro-bind /lib64 /lib64 \
-  --ro-bind /bin /bin \
-  --ro-bind $HOME/.local $HOME/.local \
-  --ro-bind $HOME/.config $HOME/.config \
-  --ro-bind $HOME/local/go-sdk/ $HOME/local/go-sdk \
-  --bind "$HTTP_SOCKET_PATH" "$HTTP_SOCKET_PATH" \
-  --bind $HOME/go/pkg/mod $HOME/go/pkg/mod \
-  --ro-bind /etc/resolv.conf /etc/resolv.conf \
-  --ro-bind /etc/hosts /etc/hosts \
-  --ro-bind /etc/ssl /etc/ssl \
-  --ro-bind /etc/pki /etc/pki \
-  --ro-bind /etc/java /etc/java \
-  --ro-bind /etc/alternatives /etc/alternatives \
-  --ro-bind /etc/localtime /etc/localtime \
-  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
-  --ro-bind /etc/passwd /etc/passwd \
-  --ro-bind /etc/group /etc/group \
-  --ro-bind /run/user/$(id -u)/$WAYLAND_DISPLAY /run/user/$(id -u)/$WAYLAND_DISPLAY \
-  --ro-bind /run/user/$(id -u)/bus /run/user/$(id -u)/bus \
-  --dir /run/user/$(id -u) \
-  --setenv XDG_RUNTIME_DIR /run/user/$(id -u) \
-  --setenv http_proxy "http://127.0.0.1:$BRIDGE_PORT" \
-  --setenv https_proxy "http://127.0.0.1:$BRIDGE_PORT" \
-  --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
-  --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT" \
-  --setenv no_proxy "" \
-  --setenv PODMAN_PROXY_SANDBOX_ORIGIN "$PROJECT_DIR" \
-  --dir /var/home \
-  --bind $HOME/.local/share/opencode $HOME/.local/share/opencode \
-  --proc /proc \
-  --dev-bind /dev/null /dev/null \
-  --dev-bind /dev/zero /dev/zero \
-  --dev-bind /dev/random /dev/random \
-  --dev-bind /dev/urandom /dev/urandom \
-  --dev-bind /dev/full /dev/full \
-  --dev-bind /dev/tty /dev/tty \
-  --dev-bind /dev/ptmx /dev/ptmx \
-  --bind /dev/pts /dev/pts \
-  --tmpfs /dev/shm \
-  --tmpfs /tmp \
-  --tmpfs /var/tmp \
-  --bind "$PROJECT_DIR" "$PROJECT_DIR" \
-  --ro-bind "$HOME/.config/opencode" "$HOME/.config/opencode" \
-  --bind "$PROXY_SOCK" "/run/user/$(id -u)/podman/podman.sock" \
-  --unshare-net \
-  --die-with-parent \
-  --setenv HOME "$HOME" \
-  --setenv GOMODCACHE "$HOME/go/pkg/mod" \
-  --setenv OPENCODE_CONFIG_CONTENT '{"permission": {"*": "allow"}}'\
-  --chdir "$PROJECT_DIR" \
+BWRAP_ARGS=(
+  --ro-bind /usr /usr
+  --ro-bind /lib /lib
+  --ro-bind /lib64 /lib64
+  --ro-bind /bin /bin
+  --ro-bind "$HOME"/.local "$HOME"/.local
+  --ro-bind "$HOME"/.config "$HOME"/.config
+  --ro-bind "$HOME"/local/go-sdk/ "$HOME"/local/go-sdk
+  --ro-bind "$HOME"/prg/experiment/mdcoder/dist "$HOME"/prg/experiment/mdcoder/dist
+  --bind "$HTTP_SOCKET_PATH" "$HTTP_SOCKET_PATH"
+  --bind "$HOME"/go/pkg/mod "$HOME"/go/pkg/mod
+  --ro-bind /etc/resolv.conf /etc/resolv.conf
+  --ro-bind /etc/hosts /etc/hosts
+  --ro-bind /etc/ssl /etc/ssl
+  --ro-bind /etc/pki /etc/pki
+  --ro-bind /etc/java /etc/java
+  --ro-bind /etc/alternatives /etc/alternatives
+  --ro-bind /etc/localtime /etc/localtime
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
+  --ro-bind /etc/passwd /etc/passwd
+  --ro-bind /etc/group /etc/group
+  --ro-bind /etc/group /etc/group
+  --ro-bind /etc/m2.conf /etc/m2.conf
+  --ro-bind /usr/share/crypto-policies/ /usr/share/crypto-policies/
+  --ro-bind /etc/crypto-policies /etc/crypto-policies
+  --ro-bind /run/user/$(id -u)/"$WAYLAND_DISPLAY" /run/user/$(id -u)/"$WAYLAND_DISPLAY"
+  --ro-bind /run/user/$(id -u)/bus /run/user/$(id -u)/bus
+  --dir /run/user/$(id -u)
+  --setenv XDG_RUNTIME_DIR /run/user/$(id -u)
+  --setenv http_proxy "http://127.0.0.1:$BRIDGE_PORT"
+  --setenv https_proxy "http://127.0.0.1:$BRIDGE_PORT"
+  --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT"
+  --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT"
+  --setenv no_proxy ""
+  --setenv PODMAN_PROXY_SANDBOX_ORIGIN "$PROJECT_DIR"
+  --dir /var/home
+  --bind "$HOME"/.local/share/opencode "$HOME"/.local/share/opencode
+  --unshare-pid
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /var/tmp
+  --bind "$PROJECT_DIR" "$PROJECT_DIR"
+)
+
+# Extra --ro-bind, --dev-bind, --bind from command line (stored as "HOST:GUEST" pairs)
+_apply_binds() {
+    local flag="$1" # e.g. --ro-bind, --dev-bind, --bind
+    shift
+    for _pair in "$@"; do
+        _host="${_pair%%:*}"
+        _guest="${_pair#*:}"
+        _parent="$(dirname "$_guest")"
+        if [[ "$_parent" != "/" ]]; then
+            BWRAP_ARGS+=(--dir "$_parent")
+        fi
+        BWRAP_ARGS+=("$flag" "$_host" "$_guest")
+    done
+}
+_apply_binds --ro-bind  "${EXTRA_RO_BINDS[@]}"
+_apply_binds --dev-bind "${EXTRA_DEV_BINDS[@]}"
+_apply_binds --bind     "${EXTRA_BINDS[@]}"
+
+# Extra tmpfs mounts from command line
+for _extra_tmpfs in "${EXTRA_TMPFS[@]}"; do
+    _parent="$(dirname "$_extra_tmpfs")"
+    if [[ "$_parent" != "/" ]]; then
+        BWRAP_ARGS+=(--dir "$_parent")
+    fi
+    BWRAP_ARGS+=(--tmpfs "$_extra_tmpfs")
+done
+
+# Bind-mount bridge dirs for each --expose spec so the Unix socket is shared
+for _bdir in "${EXPOSE_BRIDGE_DIRS[@]}"; do
+    BWRAP_ARGS+=(--bind "$_bdir" "$_bdir")
+done
+
+# Pass expose specs into the sandbox via env var (parsed by the sh -c bootstrap)
+if [[ -n "$EXPOSE_SPECS_STR" ]]; then
+    BWRAP_ARGS+=(--setenv SANDBOX_EXPOSE_SPECS "$EXPOSE_SPECS_STR")
+fi
+
+BWRAP_ARGS+=(
+  --ro-bind "$HOME"/.config/opencode "$HOME"/.config/opencode
+  --bind "$PROXY_SOCK" "/run/user/$(id -u)/podman/podman.sock"
+  --unshare-net
+  --die-with-parent
+  --setenv HOME "$HOME"
+  --setenv GOMODCACHE "$HOME/go/pkg/mod"
+  --setenv OPENCODE_CONFIG_CONTENT '{"permission": {"*": "allow"}}'
+  --chdir "$PROJECT_DIR"
+)
+
+bwrap "${BWRAP_ARGS[@]}" \
     /bin/sh -c '
     # Create /dev symlinks (proc is already mounted)
-    ln -sf /proc/self/fd /dev/fd
+    #ln -sf /proc/self/fd /dev/fd
     ln -sf /proc/self/fd/0 /dev/stdin
     ln -sf /proc/self/fd/1 /dev/stdout
     ln -sf /proc/self/fd/2 /dev/stderr
@@ -173,13 +428,32 @@ bwrap \
     # Wait for bridge to be listening on port
     until (echo > /dev/tcp/127.0.0.1/"$2") 2>/dev/null; do sleep 0.1; done
 
-    # Shift bridge args and run target command (no exec, so we clean up socat after)
+    # Start reverse bridges for --expose specs (from env var)
+    # Format: "<dir>:<guest> <dir>:<guest> ..."
+    EXPOSE_BGPIDS=""
+    if [ -n "$SANDBOX_EXPOSE_SPECS" ]; then
+        for _spec in $SANDBOX_EXPOSE_SPECS; do
+            _bdir="${_spec%:*}"
+            _gport="${_spec##*:}"
+            socat UNIX-LISTEN:"$_bdir/sock",fork TCP:127.0.0.1:"$_gport" >/dev/null 2>&1 &
+            EXPOSE_BGPIDS="$EXPOSE_BGPIDS $!"
+        done
+    fi
+
+    # Shift bridge args and run target command (no exec, so we clean up after)
     shift 2
     "$@"
     EXIT_CODE=$?
 
-    # Kill socat so bwrap can exit cleanly
+    # Kill the http bridge socat
     kill $SOCAT_PID 2>/dev/null
     wait $SOCAT_PID 2>/dev/null
+
+    # Kill all reverse-bridge socat instances
+    for _epid in $EXPOSE_BGPIDS; do
+        kill "$_epid" 2>/dev/null
+        wait "$_epid" 2>/dev/null
+    done
+
     exit $EXIT_CODE
   ' _ "$HTTP_SOCKET_PATH" "$BRIDGE_PORT" "${TARGET_CMD[@]}"

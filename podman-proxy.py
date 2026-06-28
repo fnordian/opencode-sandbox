@@ -89,6 +89,15 @@ def parse_headers(header_bytes):
 
 def get_request_line(header_bytes):
     return header_bytes.split(b"\r\n")[0].decode(errors="replace")
+def get_status_code(header_bytes):
+    """Return the integer status code from the response line, or 0 on failure."""
+    line = header_bytes.split(b"\r\n")[0].decode(errors="replace")
+    parts = line.split(" ")
+    try:
+        return int(parts[1])
+    except (IndexError, ValueError):
+        return 0
+
 
 # ---- Policy check -----------------------------------------------------------
 
@@ -337,6 +346,18 @@ def forward_finite_response(upstream, client):
 
         te = headers.get("transfer-encoding", "").lower()
 
+        # --- No-body responses ---
+        # RFC 7230 §3.3.3: responses to HEAD requests and responses with status
+        # 1xx (Informational), 204 (No Content) or 304 (Not Modified) NEVER have
+        # a body and are complete after the header block.  Podman returns 204
+        # for POST /containers/{id}/start with no Content-Length header; without
+        # this check we would block on upstream.recv() waiting for an EOF that
+        # only arrives when podman's HTTP server eventually times out the idle
+        # keep-alive connection (observed ~10s).
+        status = get_status_code(header_bytes)
+        if (100 <= status < 200) or status in (204, 304):
+            return  # response fully forwarded (headers only)
+
         # --- Body forwarding ---
         if content_length > 0:
             remaining = content_length - len(rest)
@@ -392,15 +413,20 @@ def forward_finite_response(upstream, client):
                     return
                 buf += chunk
 
-        elif content_length == 0 and rest:
-            # Explicit empty body (e.g. 204 No Content) — nothing more to read
-            try:
-                client.sendall(rest)
-            except OSError:
-                return
+        elif content_length == 0:
+            # Explicit empty body (Content-Length: 0).  Nothing more to read;
+            # the response is complete.  (Note: 204/304 with no Content-Length
+            # is already handled above.)
+            if rest:
+                try:
+                    client.sendall(rest)
+                except OSError:
+                    return
 
         else:
-            # Connection: close or unknown — read until EOF
+            # No Content-Length and no chunked encoding — only way to detect the
+            # end of the body is upstream closing the connection (Connection:
+            # close).  Read until EOF.
             if rest:
                 try:
                     client.sendall(rest)

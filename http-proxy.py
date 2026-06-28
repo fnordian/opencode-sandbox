@@ -17,7 +17,7 @@ HOP_BY_HOP = frozenset({
 # ---- Helpers ----------------------------------------------------------------
 
 def allowed(host):
-    return any(p.match(host) for p in WHITELIST) if host else False
+    return any(p.fullmatch(host) for p in WHITELIST) if host else False
 
 
 async def pipe(reader, writer):
@@ -59,6 +59,7 @@ def _rewrite_target(target: bytes) -> bytes:
 
 async def handle(reader, writer):
     client_conn = h11.Connection(our_role=h11.SERVER)
+    tunnel_mode = False
     try:
         while True:
             # ================================================================
@@ -116,9 +117,16 @@ async def handle(reader, writer):
                 await writer.drain()
 
                 remote_r, remote_w = await asyncio.open_connection(host, port)
-                asyncio.create_task(pipe(reader, remote_w))
-                asyncio.create_task(pipe(remote_r, writer))
-                return  # tunnel owns both connections from here
+                t1 = asyncio.create_task(pipe(reader, remote_w))
+                t2 = asyncio.create_task(pipe(remote_r, writer))
+                tunnel_mode = True
+                done, pending = await asyncio.wait(
+                    [t1, t2], return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                return
 
             # ================================================================
             # Phase 3 — HTTP: parse host, check allowlist, rewrite URI
@@ -220,7 +228,8 @@ async def handle(reader, writer):
     except Exception:
         pass
     finally:
-        writer.close()
+        if not tunnel_mode:
+            writer.close()
 
 
 # ---- Main -------------------------------------------------------------------
@@ -233,4 +242,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(), debug=False)
