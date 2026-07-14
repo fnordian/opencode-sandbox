@@ -10,6 +10,7 @@ EXTRA_DEV_BINDS=()
 EXTRA_BINDS=()
 EXTRA_TMPFS=()
 ALLOW_DOMAINS=()
+ALLOW_PROFILES=()
 EXPOSE_SPECS=()       # each element "HOST:GUEST" or ":GUEST" (empty HOST = dynamic)
 TARGET_CMD=()
 OPT_TERMINATED=false
@@ -63,6 +64,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             ALLOW_DOMAINS+=("$_dom")
+            shift 2
+            ;;
+        --allow-profile)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --allow-profile requires a profile name argument" >&2
+                exit 2
+            fi
+            ALLOW_PROFILES+=("$2")
             shift 2
             ;;
         --tmpfs)                                                                                                                     
@@ -120,8 +129,8 @@ if [[ -n "${PODMAN_PROXY_SANDBOX_ORIGIN:-}" ]]; then
     if [[ "$PODMAN_PROXY_SANDBOX_ORIGIN" != "$PROJECT_DIR" ]]; then
         echo "Warning: Starting nested sandbox from different directory ('$PROJECT_DIR' vs origin '$PODMAN_PROXY_SANDBOX_ORIGIN')" >&2
     fi
-    if [[ ${#EXTRA_RO_BINDS[@]} -gt 0 || ${#EXTRA_DEV_BINDS[@]} -gt 0 || ${#EXTRA_BINDS[@]} -gt 0 || ${#EXTRA_TMPFS[@]} -gt 0 || ${#EXPOSE_SPECS[@]} -gt 0 || ${#ALLOW_DOMAINS[@]} -gt 0 ]]; then
-        echo "Warning: --ro-bind/--dev-bind/--bind/--tmpfs/--expose/--allow-domain ignored in nested sandbox" >&2
+    if [[ ${#EXTRA_RO_BINDS[@]} -gt 0 || ${#EXTRA_DEV_BINDS[@]} -gt 0 || ${#EXTRA_BINDS[@]} -gt 0 || ${#EXTRA_TMPFS[@]} -gt 0 || ${#EXPOSE_SPECS[@]} -gt 0 || ${#ALLOW_DOMAINS[@]} -gt 0 || ${#ALLOW_PROFILES[@]} -gt 0 ]]; then
+        echo "Warning: --ro-bind/--dev-bind/--bind/--tmpfs/--expose/--allow-domain/--allow-profile ignored in nested sandbox" >&2
     fi
     exec "${TARGET_CMD[@]}"
 fi
@@ -139,67 +148,16 @@ BRIDGE_PORT=8888
 # Unique socket path in user runtime dir
 HTTP_SOCKET_PATH="/run/user/$(id -u)/sandbox-proxy-$$.sock"
 
-WHITELIST=(
-    # AI / LLM Providers
-    "(?:.*\.)?anthropic\.com"
-    "(?:.*\.)?deepseek\.com"
-    "(?:.*\.)?openai\.com"
-    "(?:.*\.)?openrouter\.ai"
+# Profile directory: profiles/ next to this script (must exist)
+PROFILE_DIR="$SCRIPT_DIR/profiles"
 
-    # Code / Dev Tools
-    "(?:.*\.)?opencode\.ai"
-    "(?:.*\.)?github\.com"               # covers github.com and *.github.com
-
-    # Package Registries
-    "(?:.*\.)?golang\.org"
-    "(?:.*\.)?maven\.org"
-    "(?:.*\.)?npmjs\.org"
-    "(?:.*\.)?pythonhosted\.org"
-    "(?:.*\.)?pypi\.org"                 # covers pypi.org and *.pypi.org (e.g. files.pypi.org)
-    "(?:.*\.)?maven\.org"
-    "(?:.*\.)?apache\.org"
-    "jcenter\.bintray\.com"
-    "(?:.*\.)?maven\.energybox\.com"
-
-    # Container Registries
-    "auth\.docker\.io"
-    "production\.cloudflare\.docker\.com"
-    "registry-1\.docker\.io"
-    "(?:.*\.)?docker\.com"
-    "(?:.*\.)?docker\.io"
-
-    # Infrastructure / Monitoring
-    "(?:.*\.)?googleapis\.com"
-    "(?:.*\.)?sentry\.io"
-
-    # Code Hosting / Blob Storage (commonly needed by pip install from GitHub)
-    "(?:.*\.)?raw\.githubusercontent\.com"
-
-    "127\.0\.0\.1"
-
-    # Cisco documentation
-    "developer\.cisco\.com"
-    "(?:.*\.)?devnetcloud\.com"
-
-    # General information sources
-
-    "(?:.*\.)?gnome\.org"
-    "(?:.*\.)?wikipedia\.org"
-    "(?:.*\.)?linuxuprising\.com"
-    "(?:.*\.)?docs\.dev"
-    "(?:.*\.)?readthedocs\.org"
-    "(?:.*\.)?python\.org"
-    "(?:.*\.)?react\.dev"
-    "(?:.*\.)?stackoverflow\.com"
-    "(?:.*\.)?duckduckgo\.com"
-    "(?:.*\.)?reddit\.com"
-    "(?:.*\.)?githubusercontent\.com"
-    "(?:.*\.)?microsoft\.com"
-    "(?:.*\.)?confluent\.io"
-
-    # Energybox observability
-    "logs\.energybox\.com"
-)
+# Always include base, then append any extra profiles (dedup)
+_EXTRA_PROFILE_ARGS=(--profile base)
+for _p in "${ALLOW_PROFILES[@]}"; do
+    if [[ "$_p" != "base" ]]; then
+        _EXTRA_PROFILE_ARGS+=(--profile "$_p")
+    fi
+done
 
 # Convert extra allow-domains to auto-subdomain regex patterns
 ALLOW_DOMAINS_REGEX=()
@@ -211,7 +169,9 @@ done
 
 # 1. Start proxy in background
 # It creates the Unix socket file
-"$VENV_PYTHON" "$HTTP_PROXY_SCRIPT" "$HTTP_SOCKET_PATH" "${WHITELIST[@]}" "${ALLOW_DOMAINS_REGEX[@]}" &
+"$VENV_PYTHON" "$HTTP_PROXY_SCRIPT" "$HTTP_SOCKET_PATH" \
+    --db-dir "$PROFILE_DIR" "${_EXTRA_PROFILE_ARGS[@]}" \
+    "${ALLOW_DOMAINS_REGEX[@]}" &
 HTTP_PROXY_PID=$!
 
 # 2. Wait for socket to be ready
@@ -330,6 +290,7 @@ BWRAP_ARGS=(
   --ro-bind "$HOME"/prg/experiment/mdcoder/dist "$HOME"/prg/experiment/mdcoder/dist
   --bind "$HTTP_SOCKET_PATH" "$HTTP_SOCKET_PATH"
   --bind "$HOME"/go/pkg/mod "$HOME"/go/pkg/mod
+  --bind "$HOME"/.m2/repository "$HOME"/.m2/repository
   --ro-bind /etc/resolv.conf /etc/resolv.conf
   --ro-bind /etc/hosts /etc/hosts
   --ro-bind /etc/ssl /etc/ssl
@@ -352,6 +313,7 @@ BWRAP_ARGS=(
   --setenv https_proxy "http://127.0.0.1:$BRIDGE_PORT"
   --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT"
   --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT"
+  --setenv MAVEN_OPTS "-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=$BRIDGE_PORT -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=$BRIDGE_PORT"
   --setenv no_proxy ""
   --setenv PODMAN_PROXY_SANDBOX_ORIGIN "$PROJECT_DIR"
   --dir /var/home

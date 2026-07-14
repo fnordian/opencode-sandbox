@@ -13,7 +13,7 @@ Positional arguments:
 Options:
     -h, --help        Show this help message and exit.
 """
-import sys, os, socket, threading, json, re, argparse
+import sys, os, socket, threading, json, re, argparse, struct
 
 parser = argparse.ArgumentParser(
     description="Podman socket proxy — enforces sandbox policies on container creation."
@@ -98,6 +98,90 @@ def get_status_code(header_bytes):
     except (IndexError, ValueError):
         return 0
 
+# ---- Sandbox network-namespace detection ------------------------------------
+#
+# The sandbox runs with --unshare-net, so its 127.0.0.1 is distinct from the
+# host's. Containers created via host podman land on the host netns by default,
+# making their ports unreachable from inside the sandbox. To fix this *without*
+# burdening the user, the proxy rewrites every container-create body to place
+# the container in the **sandbox's** network namespace, so the container's
+# listening ports appear directly on the sandbox loopback.
+#
+# The sandbox's netns is discovered via SO_PEERCRED: the connecting podman
+# client runs inside the sandbox, and the proxy (a host-side process) reads the
+# peer's PID as seen from the host namespace. /proc/<host_pid>/ns/net is then
+# the sandbox's netns file, which host podman accepts via `ns:`/`nsmode:path`.
+
+_CONTENT_LENGTH_RE = re.compile(rb'content-length:\s*\d+', re.IGNORECASE)
+
+def get_peer_netns_path(sock):
+    """Return /proc/<peer_pid>/ns/net for the Unix-socket peer, or None.
+
+    Uses SO_PEERCRED (Linux) to obtain the connecting process's PID as visible
+    from this (host-side) process, then resolves its network-namespace file.
+    Returns None if credentials are unavailable or the path does not exist.
+    """
+    try:
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        pid = struct.unpack('iII', creds)[0]
+        if pid <= 0:
+            return None
+        path = f"/proc/{pid}/ns/net"
+        if os.path.exists(path):
+            return path
+    except OSError:
+        pass
+    return None
+
+def force_netns(body_bytes, netns_path):
+    """Rewrite a container-create body to join the given network namespace.
+
+    Handles both API shapes podman exposes:
+      * Libpod (flat): sets `netns` = {"nsmode":"path","value":<path>} and
+        clears `portmappings` (publishing is meaningless in ns/path mode and
+        podman itself nulls them when --network=ns: is used).
+      * Docker-compatible (HostConfig): sets `NetworkMode` = "ns:<path>" and
+        leaves PortBindings untouched (podman accepts and records them as
+        null bindings, preserving the user's intent).
+
+    Returns the (possibly replaced) body bytes. Non-JSON bodies are returned
+    unchanged so the proxy never breaks a non-JSON request.
+    """
+    try:
+        body = json.loads(body_bytes)
+    except Exception:
+        return body_bytes
+    if not isinstance(body, dict):
+        return body_bytes
+
+    hc = body.get("HostConfig")
+    if isinstance(hc, dict):
+        # Docker-compatible format
+        hc["NetworkMode"] = f"ns:{netns_path}"
+        # Podman accepts PortBindings with ns mode (records them as null); keep
+        # them so clients that inspect bindings still see the exposed ports.
+    else:
+        # Libpod format
+        body["netns"] = {"nsmode": "path", "value": netns_path}
+        body["portmappings"] = None
+        body["Networks"] = None
+
+    return json.dumps(body).encode()
+
+def rewrite_content_length(header_bytes, new_length):
+    """Return header_bytes with the Content-Length value replaced.
+
+    `header_bytes` is the full request header block including the trailing
+    CRLFCRLF. If a Content-Length header exists it is rewritten in place
+    (case-insensitively); otherwise one is inserted before the terminator.
+    """
+    replacement = b'Content-Length: ' + str(new_length).encode()
+    if _CONTENT_LENGTH_RE.search(header_bytes):
+        return _CONTENT_LENGTH_RE.sub(replacement, header_bytes, count=1)
+    # No Content-Length header: strip the trailing CRLFCRLF, add a CRLF for the
+    # new header line, then the header, then the terminating CRLFCRLF.
+    return header_bytes[:-4] + b'\r\n' + replacement + b'\r\n\r\n'
+
 
 # ---- Policy check -----------------------------------------------------------
 
@@ -109,7 +193,7 @@ def check_body(body_bytes):
         return None  # not JSON, let podman handle it
 
     # ============ Docker-compatible API format (HostConfig) ============
-    hc = body.get("HostConfig", {})
+    hc = body.get("HostConfig") or {}
     if hc:
         if hc.get("Privileged"):
             return "privileged mode is not allowed"
@@ -126,7 +210,13 @@ def check_body(body_bytes):
             return "CgroupnsMode=host is not allowed"
 
         # Capabilities that can enable escape
-        for cap in hc.get("CapAdd", []):
+        cap_add = hc.get("CapAdd") or []
+        if isinstance(cap_add, str):
+            # Podman/Docker accept a scalar shorthand like "ALL"
+            if cap_add.upper() == "ALL":
+                return "capability 'ALL' is not allowed"
+            cap_add = [cap_add]
+        for cap in cap_add:
             if cap.upper() in DANGEROUS_CAPS:
                 return f"capability '{cap}' is not allowed"
 
@@ -135,7 +225,10 @@ def check_body(body_bytes):
             return "device passthrough is not allowed (remove --device)"
 
         # Security options that weaken isolation
-        for opt in hc.get("SecurityOpt", []):
+        sec_opts = hc.get("SecurityOpt") or []
+        if isinstance(sec_opts, str):
+            sec_opts = [sec_opts]
+        for opt in sec_opts:
             opt_lower = opt.lower()
             if opt_lower in BLOCKED_SECURITY_OPTS:
                 return f"security option '{opt}' is not allowed"
@@ -146,13 +239,16 @@ def check_body(body_bytes):
         if hc.get("UsernsMode") == "host":
             return "UsernsMode=host is not allowed"
 
-        for bind in hc.get("Binds", []):
+        binds = hc.get("Binds") or []
+        if isinstance(binds, str):
+            binds = [binds]
+        for bind in binds:
             host_part = bind.split(":")[0]
             real = os.path.realpath(host_part)
             if not (real == PROJECT_DIR or real.startswith(PROJECT_DIR + "/")):
                 return f"bind mount '{host_part}' is outside project directory"
 
-        for mount in hc.get("Mounts", []):
+        for mount in (hc.get("Mounts") or []):
             if mount.get("Type") == "bind" or mount.get("type") == "bind":
                 src = mount.get("Source", "") or mount.get("source", "")
                 if src:
@@ -160,7 +256,7 @@ def check_body(body_bytes):
                     if not (real == PROJECT_DIR or real.startswith(PROJECT_DIR + "/")):
                         return f"bind mount source '{src}' is outside project directory"
 
-        for mount in body.get("Mounts", []):
+        for mount in (body.get("Mounts") or []):
             if mount.get("Type") == "bind" or mount.get("type") == "bind":
                 src = mount.get("Source", "") or mount.get("source", "")
                 if src:
@@ -190,7 +286,12 @@ def check_body(body_bytes):
             return f"{label}='{mode}' is not allowed"
 
     # Libpod: capability additions
-    for cap in body.get("cap_add", []):
+    cap_add = body.get("cap_add") or []
+    if isinstance(cap_add, str):
+        if cap_add.upper() == "ALL":
+            return "capability 'ALL' is not allowed"
+        cap_add = [cap_add]
+    for cap in cap_add:
         if cap.upper() in DANGEROUS_CAPS:
             return f"capability '{cap}' is not allowed"
 
@@ -199,7 +300,10 @@ def check_body(body_bytes):
         return "device passthrough is not allowed (remove --device)"
 
     # Libpod: security options
-    for opt in body.get("security_opt", []):
+    sec_opts = body.get("security_opt") or []
+    if isinstance(sec_opts, str):
+        sec_opts = [sec_opts]
+    for opt in sec_opts:
         opt_lower = opt.lower()
         if opt_lower in BLOCKED_SECURITY_OPTS:
             return f"security option '{opt}' is not allowed"
@@ -216,7 +320,7 @@ def check_body(body_bytes):
             return "userns=host is not allowed"
 
     # Libpod mounts (lowercase!)
-    for mount in body.get("mounts", []):
+    for mount in (body.get("mounts") or []):
         if isinstance(mount, dict):
             src = mount.get("source", "") or mount.get("Source", "")
             mtype = mount.get("type", "").lower()
@@ -276,6 +380,46 @@ def is_container_create(header_bytes):
     line = get_request_line(header_bytes)
     return "POST" in line and re.search(r"/containers/create", line) is not None
 
+def is_container_inspect(header_bytes):
+    """Match GET /containers/{id}/json (Docker-compat and libpod, versioned or not)."""
+    line = get_request_line(header_bytes)
+    if not line.startswith("GET "):
+        return False
+    return re.search(r"/containers/[^/]+/json", line) is not None
+
+def rewrite_inspect_ports(body_bytes):
+    """Synthesize port bindings for an inspect response so clients using the
+    Docker port-mapping model (e.g. Testcontainers getMappedPort) see each
+    exposed port as its own mapped port on 127.0.0.1.
+
+    In ns: mode podman records exposed ports with `null` bindings (no
+    host-side publishing). The container is nonetheless reachable at
+    127.0.0.1:<exposed> on the sandbox loopback, so returning that as the
+    "mapped port" is functionally accurate. Returns (new_body, changed).
+    """
+    try:
+        body = json.loads(body_bytes)
+    except Exception:
+        return body_bytes, False
+    if not isinstance(body, dict):
+        return body_bytes, False
+    ns = body.get("NetworkSettings")
+    if not isinstance(ns, dict):
+        return body_bytes, False
+    ports = ns.get("Ports")
+    if not isinstance(ports, dict):
+        return body_bytes, False
+    changed = False
+    for key, binding in list(ports.items()):
+        if binding is None or (isinstance(binding, list) and len(binding) == 0):
+            # key is like "6379/tcp" — the exposed port is the host port too
+            port_num = key.split("/")[0]
+            ports[key] = [{"HostIp": "127.0.0.1", "HostPort": port_num}]
+            changed = True
+    if not changed:
+        return body_bytes, False
+    return json.dumps(body).encode(), True
+
 BLOCKED_ENDPOINTS = re.compile(
     r"/(build|commit|pods/create|containers/[^/]+/exec)"
 )
@@ -318,6 +462,135 @@ def pipe_sockets(src, dst):
         except: pass
 
 # ---- Forward finite response ------------------------------------------------
+
+def _dechunk_body(upstream, rest):
+    """Read the remainder of a chunked transfer-encoded body from upstream,
+    decode it, and return the de-chunked body bytes.  Returns None on failure.
+
+    `rest` is the bytes already read after the header CRLFCRLF (may be empty).
+    """
+    buf = rest
+    terminator = b"0\r\n\r\n"
+    while terminator not in buf:
+        try:
+            chunk = upstream.recv(65536)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+
+    end = buf.index(terminator) + len(terminator)
+    raw = buf[:end]
+
+    body = b""
+    pos = 0
+    while pos < len(raw):
+        crlf = raw.find(b'\r\n', pos)
+        if crlf < 0:
+            break
+        hex_size = raw[pos:crlf]
+        try:
+            size = int(hex_size, 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        chunk_start = crlf + 2
+        chunk_end = chunk_start + size
+        body += raw[chunk_start:chunk_end]
+        pos = chunk_end + 2  # trailing \r\n after chunk data
+    return body
+
+
+def _strip_transfer_encoding(header_bytes):
+    """Return header_bytes with any Transfer-Encoding header removed.
+
+    Does not modify other headers or the request/status line.
+    """
+    # Match the full line containing Transfer-Encoding (case-insensitive)
+    te_re = re.compile(rb'^transfer-encoding:\s*.+\r\n', re.IGNORECASE | re.MULTILINE)
+    return te_re.sub(b'', header_bytes)
+
+
+def forward_inspect_response(upstream, client):
+    """Forward a container-inspect response, rewriting null port bindings to
+    synthetic 127.0.0.1:<exposed> mappings (see rewrite_inspect_ports).
+
+    Buffers the full response body regardless of framing (chunked,
+    Content-Length, or connection-close) so the rewrite can be applied,
+    then always delivers the response with Content-Length framing.
+    """
+    try:
+        header_bytes, rest = recv_until_double_crlf(upstream)
+        if header_bytes is None:
+            return
+
+        headers = parse_headers(header_bytes)
+        try:
+            content_length = int(headers.get("content-length", "0"))
+        except (ValueError, TypeError):
+            content_length = 0
+        te = headers.get("transfer-encoding", "").lower()
+
+        status = get_status_code(header_bytes)
+        if (100 <= status < 200) or status in (204, 304):
+            try:
+                client.sendall(header_bytes)
+            except OSError:
+                pass
+            return
+
+        # ---- Buffer the full response body ----
+        if content_length > 0:
+            body = rest
+            while len(body) < content_length:
+                try:
+                    chunk = upstream.recv(min(65536, content_length - len(body)))
+                except OSError:
+                    return
+                if not chunk:
+                    break
+                body += chunk
+            body = body[:content_length]
+
+        elif "chunked" in te:
+            body = _dechunk_body(upstream, rest)
+            if body is None:
+                # Buffering failed — forward headers + rest verbatim
+                try:
+                    client.sendall(header_bytes + rest)
+                except OSError:
+                    pass
+                return
+
+        else:
+            # Connection-close: read until EOF
+            body = rest
+            try:
+                while True:
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+            except OSError:
+                pass
+
+        # ---- Attempt port-binding rewrite; always re-frame as Content-Length ----
+        new_body, changed = rewrite_inspect_ports(body)
+        # Strip any Transfer-Encoding header (we always send Content-Length now)
+        new_header = _strip_transfer_encoding(header_bytes)
+        new_header = rewrite_content_length(new_header, len(new_body if changed else body))
+
+        try:
+            client.sendall(new_header + (new_body if changed else body))
+        except OSError:
+            return
+
+        if changed:
+            log("rewrote inspect ports -> sandbox loopback")
+    except Exception:
+        log("unexpected error forwarding inspect response")
 
 def forward_finite_response(upstream, client):
     """
@@ -465,6 +738,24 @@ def handle(client):
 
             # --- Container create policy enforcement ---
             if is_container_create(header_bytes):
+                # Place the container in the sandbox's network namespace so its
+                # ports are reachable on the sandbox loopback (the sandbox runs
+                # --unshare-net; without this, host podman would attach the
+                # container to the host netns and its ports would be invisible
+                # from inside the sandbox). Discovered automatically from the
+                # connecting client via SO_PEERCRED — no user flag needed.
+                netns_path = get_peer_netns_path(client)
+                if netns_path:
+                    new_body = force_netns(body_bytes, netns_path)
+                    if new_body != body_bytes:
+                        body_bytes = new_body
+                        header_bytes = rewrite_content_length(
+                            header_bytes, len(body_bytes))
+                        log(f"forced container netns -> {netns_path}")
+                else:
+                    log("warning: could not determine sandbox netns; "
+                        "container will use podman's default network")
+
                 err = check_body(body_bytes)
                 if err:
                     log(f"BLOCKED: {err}")
@@ -518,7 +809,13 @@ def handle(client):
                 break
 
             # --- Finite response ---
-            forward_finite_response(upstream, client)
+            # Inspect responses get port bindings synthesized so clients using
+            # the Docker port-mapping model (Testcontainers getMappedPort) see
+            # the exposed port as a mapped port on the sandbox loopback.
+            if is_container_inspect(header_bytes):
+                forward_inspect_response(upstream, client)
+            else:
+                forward_finite_response(upstream, client)
             upstream.close()
     finally:
         try:
