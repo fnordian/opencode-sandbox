@@ -285,7 +285,9 @@ BWRAP_ARGS=(
   --ro-bind /lib64 /lib64
   --ro-bind /bin /bin
   --ro-bind "$HOME"/.local "$HOME"/.local
+  --ro-bind "$HOME"/.m2/sandbox-settings.xml "$HOME"/.m2/settings.xml
   --ro-bind "$HOME"/.config "$HOME"/.config
+  --ro-bind "$HOME"/.testcontainers.properties "$HOME"/.testcontainers.properties
   --ro-bind "$HOME"/local/go-sdk/ "$HOME"/local/go-sdk
   --ro-bind "$HOME"/prg/experiment/mdcoder/dist "$HOME"/prg/experiment/mdcoder/dist
   --bind "$HTTP_SOCKET_PATH" "$HTTP_SOCKET_PATH"
@@ -314,6 +316,8 @@ BWRAP_ARGS=(
   --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT"
   --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT"
   --setenv MAVEN_OPTS "-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=$BRIDGE_PORT -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=$BRIDGE_PORT"
+  --setenv MVN_PROXY_HOST "127.0.0.1"
+  --setenv MVN_PROXY_PORT "8888"
   --setenv no_proxy ""
   --setenv PODMAN_PROXY_SANDBOX_ORIGIN "$PROJECT_DIR"
   --dir /var/home
