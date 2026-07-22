@@ -15,21 +15,30 @@ Options:
 """
 import sys, os, socket, threading, json, re, argparse, struct
 
-parser = argparse.ArgumentParser(
-    description="Podman socket proxy — enforces sandbox policies on container creation."
-)
-parser.add_argument("project_dir", help="Project directory; bind mounts must stay inside this path.")
-parser.add_argument("listen_socket", help="Path to the proxy's Unix domain socket (created by proxy).")
-parser.add_argument("upstream_socket", help="Path to the real podman Unix domain socket (forward target).")
-parser.add_argument("-v", "--verbose", action="store_true",
-                    help="Print diagnostic messages to stderr.")
+# Defaults for import/testing; overridden by argparse when run directly.
+PROJECT_DIR = "/tmp"
+LISTEN_SOCK = "/tmp/podman-proxy.sock"
+UPSTREAM_SOCK = "/tmp/podman.sock"
+VERBOSE = False
 
-args = parser.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Podman socket proxy — enforces sandbox policies on container creation."
+    )
+    parser.add_argument("project_dir",
+                        help="Project directory; bind mounts must stay inside this path.")
+    parser.add_argument("listen_socket",
+                        help="Path to the proxy's Unix domain socket (created by proxy).")
+    parser.add_argument("upstream_socket",
+                        help="Path to the real podman Unix domain socket (forward target).")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print diagnostic messages to stderr.")
 
-PROJECT_DIR = os.path.realpath(args.project_dir)
-LISTEN_SOCK = args.listen_socket
-UPSTREAM_SOCK = args.upstream_socket
-VERBOSE = args.verbose
+    args = parser.parse_args()
+    PROJECT_DIR = os.path.realpath(args.project_dir)
+    LISTEN_SOCK = args.listen_socket
+    UPSTREAM_SOCK = args.upstream_socket
+    VERBOSE = args.verbose
 
 BLOCKED_NETWORK_MODES = {"host"}
 
@@ -53,6 +62,12 @@ BLOCKED_SECURITY_OPT_PREFIXES = (
     "label=user:", "label=role:", "label=type:", "label=level:",
     "systempaths=unconfined",
 )
+
+# Sandbox marker label — injected into every container create body so the proxy
+# can verify, at exec time, that the target container was started from within the
+# sandbox (only the proxy socket is reachable from the sandbox, so only
+# proxy-processed creates carry this label).
+SANDBOX_LABEL = "io.sandbox.proxy.created"
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -165,6 +180,38 @@ def force_netns(body_bytes, netns_path):
         body["netns"] = {"nsmode": "path", "value": netns_path}
         body["portmappings"] = None
         body["Networks"] = None
+
+    return json.dumps(body).encode()
+
+def inject_sandbox_label(body_bytes):
+    """Inject the sandbox marker label into a container-create body.
+
+    Handles both Docker-compat (top-level ``Labels``) and Libpod (top-level
+    ``labels``).  Merges with any existing labels so the caller's labels are
+    preserved.  Non-JSON bodies are returned unchanged.
+    """
+    try:
+        body = json.loads(body_bytes)
+    except Exception:
+        return body_bytes
+    if not isinstance(body, dict):
+        return body_bytes
+
+    # Docker-compat body shape — top-level "Labels"
+    labels = body.get("Labels")
+    if not isinstance(labels, dict):
+        labels = {}
+    if SANDBOX_LABEL not in labels:
+        labels[SANDBOX_LABEL] = "true"
+        body["Labels"] = labels
+
+    # Libpod body shape — top-level "labels" (lowercase)
+    llabels = body.get("labels")
+    if not isinstance(llabels, dict):
+        llabels = {}
+    if SANDBOX_LABEL not in llabels:
+        llabels[SANDBOX_LABEL] = "true"
+        body["labels"] = llabels
 
     return json.dumps(body).encode()
 
@@ -421,17 +468,32 @@ def rewrite_inspect_ports(body_bytes):
     return json.dumps(body).encode(), True
 
 BLOCKED_ENDPOINTS = re.compile(
-    r"/(build|commit|pods/create|containers/[^/]+/exec)"
+    r"/(build|commit|pods/create)"
 )
 
 def is_blocked_endpoint(header_bytes):
     """Return an error string if the endpoint is blocked outright, else None."""
     line = get_request_line(header_bytes)
     if "POST" in line and re.search(BLOCKED_ENDPOINTS, line):
-        m = re.search(r"(build|commit|pods/create|exec)", line)
+        m = re.search(r"(build|commit|pods/create)", line)
         what = m.group(1) if m else "operation"
         return f"{what} is not allowed by sandbox policy"
     return None
+
+# ---- Exec request helpers (label-based authorization) ------------------------
+
+_EXEC_RE = re.compile(r"POST\s+.*/containers/([^/\s]+)/exec\b")
+
+def is_exec_request(header_bytes):
+    """Return True if the request is a POST to a container exec endpoint."""
+    line = get_request_line(header_bytes)
+    return bool(_EXEC_RE.search(line))
+
+def extract_container_id(header_bytes):
+    """Extract the container ID from an exec request URL, or None."""
+    line = get_request_line(header_bytes)
+    m = _EXEC_RE.search(line)
+    return m.group(1) if m else None
 
 # ---- Streaming endpoints (infinite response) --------------------------------
 INFINITE_STREAM_PATTERNS = re.compile(
@@ -716,6 +778,144 @@ def forward_finite_response(upstream, client):
     except Exception:
         log("unexpected error forwarding response")
 
+
+# ---- Exec label verification -------------------------------------------------
+
+def container_has_sandbox_label(container_id):
+    """Check whether *container_id* carries the sandbox marker label.
+
+    Opens a transient connection to the upstream podman socket, sends an
+    inspect request, and checks for *SANDBOX_LABEL* in both ``Config.Labels``
+    (Docker-compat inspect shape) and top-level ``Labels`` (libpod fallback).
+
+    Fail-closed: returns ``False`` on any connectivity, parse, or
+    non-2xx response.
+    """
+    try:
+        up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        up.settimeout(10)
+        up.connect(UPSTREAM_SOCK)
+        req = (
+            f"GET /containers/{container_id}/json HTTP/1.1\r\n"
+            f"Host: podman\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+        up.sendall(req)
+
+        header_bytes, rest = recv_until_double_crlf(up)
+        if header_bytes is None:
+            up.close()
+            return False
+
+        status = get_status_code(header_bytes)
+        if status < 200 or status >= 300:
+            up.close()
+            return False
+
+        # Read the full response body
+        headers = parse_headers(header_bytes)
+        try:
+            content_length = int(headers.get("content-length", "0"))
+        except (ValueError, TypeError):
+            content_length = 0
+        te = headers.get("transfer-encoding", "").lower()
+
+        if content_length > 0:
+            body = rest
+            while len(body) < content_length:
+                try:
+                    chunk = up.recv(min(65536, content_length - len(body)))
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                body += chunk
+            body = body[:content_length]
+        elif "chunked" in te:
+            body = _dechunk_body(up, rest)
+            if body is None:
+                up.close()
+                return False
+        else:
+            # Connection-close: read until EOF
+            body = rest
+            try:
+                while True:
+                    chunk = up.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+            except OSError:
+                pass
+
+        up.close()
+
+        try:
+            info = json.loads(body)
+        except Exception:
+            return False
+
+        # Docker-compat inspect shape
+        config = info.get("Config") or {}
+        clabels = config.get("Labels") or {}
+        if SANDBOX_LABEL in clabels:
+            return True
+
+        # Libpod inspect shape (top-level Labels)
+        tlabels = info.get("Labels") or {}
+        if SANDBOX_LABEL in tlabels:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+def forward_exec_if_allowed(header_bytes, body_bytes, client):
+    """Authorize an exec request via label check, then forward if allowed.
+
+    Returns the upstream socket with the original exec request already sent
+    on success, or ``None`` if the exec was denied (a 403 was sent to the
+    client).
+    """
+    cid = extract_container_id(header_bytes)
+    if not cid:
+        log("exec request: could not extract container ID")
+        try:
+            client.sendall(forbidden("exec request malformed"))
+        except OSError:
+            pass
+        return None
+
+    log(f"exec request for container {cid} — checking sandbox label")
+
+    if not container_has_sandbox_label(cid):
+        log(f"exec DENIED — container {cid} lacks sandbox label")
+        try:
+            client.sendall(forbidden(
+                "exec is only allowed on containers created "
+                "through the sandbox proxy"
+            ))
+        except OSError:
+            pass
+        return None
+
+    log(f"exec ALLOWED — container {cid} has sandbox label")
+
+    # Open a fresh upstream connection and send the original exec request
+    try:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        upstream.settimeout(30)
+        upstream.connect(UPSTREAM_SOCK)
+        upstream.sendall(header_bytes + body_bytes)
+        return upstream
+    except OSError:
+        log("exec: failed to connect/send to upstream")
+        return None
+
+
 # ---- Main connection handler ------------------------------------------------
 
 def handle(client):
@@ -756,6 +956,15 @@ def handle(client):
                     log("warning: could not determine sandbox netns; "
                         "container will use podman's default network")
 
+                # Inject sandbox marker label so exec is allowed for containers
+                # created through the proxy.
+                new_body = inject_sandbox_label(body_bytes)
+                if new_body != body_bytes:
+                    body_bytes = new_body
+                    header_bytes = rewrite_content_length(
+                        header_bytes, len(body_bytes))
+                    log("injected sandbox marker label")
+
                 err = check_body(body_bytes)
                 if err:
                     log(f"BLOCKED: {err}")
@@ -765,7 +974,7 @@ def handle(client):
                         pass
                     break
 
-            # --- Endpoint blocking (exec, build, commit, pods) ---
+            # --- Endpoint blocking (build, commit, pods) ---
             err = is_blocked_endpoint(header_bytes)
             if err:
                 log(f"BLOCKED endpoint: {err}")
@@ -775,14 +984,23 @@ def handle(client):
                     pass
                 break
 
-            # --- Forward to upstream ---
-            try:
-                upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                upstream.settimeout(30)
-                upstream.connect(UPSTREAM_SOCK)
-                upstream.sendall(header_bytes + body_bytes)
-            except OSError:
-                break
+            # --- Exec request: label-based authorization ---
+            upstream = None
+            if is_exec_request(header_bytes):
+                upstream = forward_exec_if_allowed(
+                    header_bytes, body_bytes, client)
+                if upstream is None:
+                    break   # denied or error; 403 already sent
+
+            # --- Forward to upstream (only if not already connected) ---
+            if upstream is None:
+                try:
+                    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    upstream.settimeout(30)
+                    upstream.connect(UPSTREAM_SOCK)
+                    upstream.sendall(header_bytes + body_bytes)
+                except OSError:
+                    break
 
             # --- Streaming (infinite response)? ---
             if is_infinite_stream(rl):
