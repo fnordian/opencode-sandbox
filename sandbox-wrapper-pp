@@ -310,12 +310,15 @@ BWRAP_ARGS=(
   --ro-bind /run/user/$(id -u)/"$WAYLAND_DISPLAY" /run/user/$(id -u)/"$WAYLAND_DISPLAY"
   --ro-bind /run/user/$(id -u)/bus /run/user/$(id -u)/bus
   --dir /run/user/$(id -u)
+  --ro-bind /run/user/$(id -u)/mcp-gateway/gateway.sock /run/user/$(id -u)/mcp-gateway/gateway.sock
   --setenv XDG_RUNTIME_DIR /run/user/$(id -u)
   --setenv http_proxy "http://127.0.0.1:$BRIDGE_PORT"
   --setenv https_proxy "http://127.0.0.1:$BRIDGE_PORT"
   --setenv HTTP_PROXY "http://127.0.0.1:$BRIDGE_PORT"
   --setenv HTTPS_PROXY "http://127.0.0.1:$BRIDGE_PORT"
   --setenv MAVEN_OPTS "-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=$BRIDGE_PORT -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=$BRIDGE_PORT"
+  --setenv TESTCONTAINERS_RYUK_DISABLED true
+  --setenv TESTCONTAINERS_REUSE_CONTAINER false
   --setenv MVN_PROXY_HOST "127.0.0.1"
   --setenv MVN_PROXY_PORT "8888"
   --setenv no_proxy ""
@@ -374,7 +377,6 @@ BWRAP_ARGS+=(
   --die-with-parent
   --setenv HOME "$HOME"
   --setenv GOMODCACHE "$HOME/go/pkg/mod"
-  --setenv OPENCODE_CONFIG_CONTENT '{"permission": {"*": "allow"}}'
   --chdir "$PROJECT_DIR"
 )
 
